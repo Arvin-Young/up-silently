@@ -1,0 +1,252 @@
+Java HTTP 组件库选型看这篇就够了
+
+最近项目需要使用 Java 重度调用 HTTP API 接口，于是想着封装一个团队公用的 HTTP client lib. 这个库需要支持以下特性：
+
+连接池管理，包括连接创建和超时、空闲连接数控制、每个 host 的连接数配置等。基本上，我们想要一个 go HTTP 标准库自带的连接吃管理功能。
+域名解析控制。因为调用量会比较大，因此希望在域名解析这一层做一个调用端可控的负载均衡，同时可以对每个服务器 IP 进行失败率统计和健康度检查。
+Form/JSON 调用支持良好。
+支持同步和异步调用。
+在 Java 生态中，虽然有数不清的 HTTP client lib 组件库，但是大体可以分为这三类：
+
+JDK 自带的 HttpURLConnection 标准库；
+Apache HttpComponents HttpClient, 以及基于该库的 wrapper, 如 Unirest.
+非基于 Apache HttpComponents HttpClient， 大量重写应用层代码的 HTTP client 组件库，典型代表是 OkHttp.
+HttpURLConnection
+使用 HttpURLConnection 发起 HTTP 请求最大的优点是不需要引入额外的依赖，但是使用起来非常繁琐，也缺乏连接池管理、域名机械控制等特性支持。以发起一个 HTTP POST 请求为例
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+ 
+ 
+public class HttpUrlConnectionDemo {
+ 
+    public static void main(String[] args) throws Exception {
+        String urlString = "https://httpbin.org/post";
+        String bodyString = "password=e10adc3949ba59abbe56e057f20f883e&amp;username=test3";
+ 
+        URL url = new URL(urlString);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+ 
+        OutputStream os = conn.getOutputStream();
+        os.write(bodyString.getBytes("utf-8"));
+        os.flush();
+        os.close();
+ 
+        if (conn.getResponseCode() == HttpURLConnection.HTTP_OK) {
+            InputStream is = conn.getInputStream();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(is));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+            System.out.println("rsp:" + sb.toString());
+        } else {
+            System.out.println("rsp code:" + conn.getResponseCode());
+        }
+    }
+ 
+}
+可以看到，使用 HttpURLConnection 发起 HTTP 请求是比较原始（low level）的，基本上你可以理解为它就是对网络栈传输层（HTTP 一般为 TCP，HTTP over QUIC 是 UDP）进行了一次浅层次的封装，操作原语就是在打开的连接上面写请求 request 与读响应 response. 而且 HttpURLConnection 无法支持 HTTP/2. 显然,官方是知道这些问题的，因此在 Java 9 中，官方在标准库中引入了一个 high level、支持 HTTP/2 的 HttpClient. 这个库的接口封装就非常主流到位了，发起一个简单的 POST 请求：
+
+HttpRequest request = HttpRequest.newBuilder()
+  .uri(new URI("https://postman-echo.com/post"))
+  .headers("Content-Type", "text/plain;charset=UTF-8")
+  .POST(HttpRequest.BodyProcessor.fromString("Sample request body"))
+  .build();
+封装的最大特点是链式调用非常顺滑，支持连接管理等特性。但是这个库只能在 Java 9 及以后的版本使用，Java 9 和 Java 10 并不是 LTS 维护版本，而接下来的 Java 11 LTS 要在2018.09.25发布，应用到线上还需要等待一段时间。因此，虽然挺喜欢这个自带标准库（毕竟可以不引入三方依赖），但当前是无法在生产环境使用的。
+
+Apache HttpComponents HttpClient
+Apache HttpComponents HttpClient 的前身是 Apache Commons HttpClient, 但是 Apache Commons HttpClient 已经停止开发，如果你还在使用它，请切换到 Apache HttpComponents HttpClient 上来。
+
+Apache HttpComponents HttpClient 支持的特性非常丰富，完全覆盖我们的需求，使用起来也非常顺手
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+ 
+import org.apache.commons.io.IOUtils;
+import org.apache.http.HttpResponse;
+import org.apache.http.NameValuePair;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.fluent.Request;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.RequestBuilder;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.message.BasicNameValuePair;
+import org.apache.http.impl.client.HttpClients;
+ 
+ 
+public class HttpComponentsDemo {
+    final static CloseableHttpClient client = HttpClients.createDefault();
+ 
+    // 常规调用
+    private String sendPostForm(String url, Map&lt;String, String&gt; params) throws Exception {
+        HttpPost request = new HttpPost(url);
+ 
+        // set header
+        request.setHeader("X-Http-Demo", HttpComponentsDemo.class.getSimpleName());
+ 
+        // set params
+        if (params != null) {
+            List&lt;NameValuePair&gt; nameValuePairList = new ArrayList&lt;NameValuePair&gt;();
+            for (Map.Entry&lt;String, String&gt; entry : params.entrySet()) {
+                nameValuePairList.add(new BasicNameValuePair(entry.getKey(), entry.getValue()));
+            }
+            UrlEncodedFormEntity bodyEntity = new UrlEncodedFormEntity(nameValuePairList, "UTF-8");
+            //System.out.println("body:" + IOUtils.toString(bodyEntity.getContent()));
+            request.setEntity(new UrlEncodedFormEntity(nameValuePairList));
+        }
+ 
+        // send request
+        CloseableHttpResponse response = client.execute(request);
+        // read rsp code
+        System.out.println("rsp code:" + response.getStatusLine().getStatusCode());
+        // return content
+        String ret = readResponseContent(response.getEntity().getContent());
+        response.close();
+        return ret;
+    }
+ 
+    // fluent 链式调用
+    private String sendGet(String url) throws Exception {
+        return Request.Get(url)
+                .connectTimeout(1000)
+                .socketTimeout(1000)
+                .execute().returnContent().asString();
+    }
+ 
+    private String readResponseContent(InputStream inputStream) throws Exception {
+        if (inputStream == null) {
+            return "";
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[512];
+        int len;
+        while (inputStream.available() &gt; 0) {
+            len = inputStream.read(buf);
+            out.write(buf, 0, len);
+        }
+ 
+        return out.toString();
+    }
+ 
+    public static void main(String[] args) throws Exception {
+        HttpComponentsDemo httpUrlConnectionDemo = new HttpComponentsDemo();
+        String url = "https://httpbin.org/post";
+        Map&lt;String, String&gt; params = new HashMap&lt;String, String&gt;();
+        params.put("foo", "bar中文");
+        String rsp = httpUrlConnectionDemo.sendPostForm(url, params);
+        System.out.println("http post rsp:" + rsp);
+ 
+        url = "https://httpbin.org/get";
+        System.out.println("http get rsp:" + httpUrlConnectionDemo.sendGet(url));
+    }
+}
+对 Client 细致的配置和自定义支持也是非常到位的：
+
+// Create a connection manager with custom configuration.
+PoolingHttpClientConnectionManager connManager = new PoolingHttpClientConnectionManager(
+        socketFactoryRegistry, connFactory, dnsResolver);
+ 
+// Create socket configuration
+SocketConfig socketConfig = SocketConfig.custom()
+    .setTcpNoDelay(true)
+    .build();
+// Configure the connection manager to use socket configuration either
+// by default or for a specific host.
+connManager.setDefaultSocketConfig(socketConfig);
+connManager.setSocketConfig(new HttpHost("somehost", 80), socketConfig);
+// Validate connections after 1 sec of inactivity
+connManager.setValidateAfterInactivity(1000);
+ 
+// Create message constraints
+MessageConstraints messageConstraints = MessageConstraints.custom()
+    .setMaxHeaderCount(200)
+    .setMaxLineLength(2000)
+    .build();
+// Create connection configuration
+ConnectionConfig connectionConfig = ConnectionConfig.custom()
+    .setMalformedInputAction(CodingErrorAction.IGNORE)
+    .setUnmappableInputAction(CodingErrorAction.IGNORE)
+    .setCharset(Consts.UTF_8)
+    .setMessageConstraints(messageConstraints)
+    .build();
+// Configure the connection manager to use connection configuration either
+// by default or for a specific host.
+connManager.setDefaultConnectionConfig(connectionConfig);
+connManager.setConnectionConfig(new HttpHost("somehost", 80), ConnectionConfig.DEFAULT);
+ 
+// Configure total max or per route limits for persistent connections
+// that can be kept in the pool or leased by the connection manager.
+connManager.setMaxTotal(100);
+connManager.setDefaultMaxPerRoute(10);
+connManager.setMaxPerRoute(new HttpRoute(new HttpHost("somehost", 80)), 20);
+完整示例请参考 ClientConfiguration.
+
+基本上，在 Java 原生标准库不给力的情况下，Apache HttpComponents HttpClient 是最佳的 HTTP Client library 选择。但这个库当前还不支持 HTTP/2，支持 HTTP/2 的版本还处于 beta 阶段（2018.09.23），因此并不适合用于 Android APP 中使用。
+
+OkHttp
+由于当前 Apache HttpComponents HttpClient 版本并不支持 HTTP/2, 而 HTTP/2 对于移动客户端而言，无论是从握手延迟、响应延迟，还是资源开销看都有相当吸引力。因此这就给了高层次封装且支持 HTTP/2 的 http client lib 足够的生存空间。其中最典型的要数OkHttp.
+
+import okhttp3.*;
+import org.apache.http.util.CharsetUtils;
+import java.util.HashMap;
+import java.util.Map;
+ 
+ 
+public class OkHttpDemo {
+    OkHttpClient client = new OkHttpClient();
+ 
+    private String sendPostForm(String url, final Map&lt;String, String&gt; params) throws Exception {
+        FormBody.Builder builder = new FormBody.Builder(CharsetUtils.get("UTF-8"));
+        if (params != null) {
+            for (Map.Entry&lt;String, String&gt; entry: params.entrySet()) {
+                builder.add(entry.getKey(), entry.getValue());
+            }
+        }
+        RequestBody requestBody = builder.build();
+        Request request = new Request.Builder().url(url).post(requestBody).build();
+        return client.newCall(request).execute().body().string();
+ 
+    }
+ 
+    private String sendGet(String url) throws Exception {
+        Request request = new Request.Builder().url(url).build();
+        return  client.newCall(request).execute().body().string();
+    }
+ 
+    public static void main(String[] args) throws Exception {
+        OkHttpDemo okHttpDemo = new OkHttpDemo();
+        String url = "https://httpbin.org/post";
+        Map&lt;String, String&gt; params = new HashMap&lt;String, String&gt;();
+        params.put("foo", "bar中文");
+        String rsp = okHttpDemo.sendPostForm(url, params);
+        System.out.println("http post rsp:" + rsp);
+ 
+        url = "https://httpbin.org/get";
+        System.out.println("http get rsp:" + okHttpDemo.sendGet(url));
+    }
+}
+OkHttp 接口设计友好，支持 HTTP/2，并且在弱网和无网环境下有自动检测和恢复机制，因此，是当前 Android APP 开发中使用最广泛的 HTTP clilent lib 之一。
+
+另一方面，OkHttp 提供的接口与 Java 9 中 HttpClint 接口比较类似 （严格讲，应该是 Java 9 借鉴了 OkHttp 等开源库的接口设计？），因此，对于喜欢减少依赖，钟情于原生标准库的开发者来说，在 Java 11 中，从 OkHttp 切换到标准库是相对容易的。因此，以 OkHttp 为代表的 http 库以后的使用场景可能会被蚕食一部分。
+
+小结
+HttpURLConnection 封装层次太低，并且支持特性太少，不建议在项目中使用。除非你的确不想引入第三方 HTTP 依赖（如减少包大小、目标环境不提供三方库支持等）。
+Java 9 中引入的 HttpClient，封装层次和支持特性都不错。但是因为 Java 版本的原因，应用场景还十分有限，建议观望一段时间再考虑在线上使用。
+如果你不需要 HTTP/2特性，Apache HttpComponents HttpClient 是你的最佳选择，比如在服务器之间的 HTTP 调用。否则，请使用 OkHttp, 如 Android 开发。
+扩展阅读
+Recommendations for Java http client libraries
+Google HTTP for java
+Apache HttpComponents HttpClient Examples
